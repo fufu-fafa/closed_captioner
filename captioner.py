@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Buat subtitle SRT dari file audio/video secara lokal.
+"""Generate SRT subtitles from an audio/video file, locally.
 
 Pipeline:
-  1. ffmpeg      -> WAV mono 16 kHz
-  2. Silero VAD  -> potongan ucapan (sumber timestamp)
-  3. Whisper     -> transkripsi tiap potongan (sherpa-onnx, int8, CPU)
-  4. SRT         -> maks 2 baris per subtitle, durasi dibagi sesuai jumlah karakter
+  1. ffmpeg      -> mono 16 kHz WAV
+  2. Silero VAD  -> speech segments (source of the timestamps)
+  3. Whisper     -> transcribe each segment (sherpa-onnx, int8, CPU)
+  4. SRT         -> max 2 lines per subtitle, duration split by character count
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,77 @@ DEFAULT_MODEL_DIR = Path(__file__).resolve().parent / "models"
 
 HF_BASE = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-{size}/resolve/main"
 VAD_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+
+
+# ---------------------------------------------------------------------------
+# Progress bar
+# ---------------------------------------------------------------------------
+
+class ProgressBar:
+    """Simple progress bar on stderr: percent, count, elapsed time and ETA.
+
+    If stderr is not a terminal (e.g. redirected to a file), nothing is drawn.
+    """
+
+    def __init__(self, total: float, label: str = "", unit: str = "", fmt=None):
+        self.total = max(total, 1e-9)
+        self.label = label
+        self.unit = unit
+        self.fmt = fmt or (lambda v: f"{v:.0f}")
+        self.value = 0.0
+        self.start = time.time()
+        self.last_draw = 0.0
+        self.enabled = sys.stderr.isatty()
+
+    def update(self, value: float, force: bool = False) -> None:
+        self.value = min(value, self.total)
+        now = time.time()
+        if force or now - self.last_draw >= 0.1 or self.value >= self.total:
+            self.last_draw = now
+            self.draw()
+
+    def advance(self, amount: float) -> None:
+        self.update(self.value + amount)
+
+    def draw(self) -> None:
+        if not self.enabled:
+            return
+        frac = self.value / self.total
+        elapsed = time.time() - self.start
+        eta = elapsed / frac - elapsed if frac > 0 else 0
+        info = (f" {frac * 100:5.1f}%  {self.fmt(self.value)}/{self.fmt(self.total)}{self.unit}"
+                f"  {fmt_clock(elapsed)}<{fmt_clock(eta)}")
+        cols = shutil.get_terminal_size((80, 20)).columns
+        width = max(10, min(40, cols - len(self.label) - len(info) - 3))
+        filled = frac * width
+        full = int(filled)
+        partial = " ▏▎▍▌▋▊▉"[int((filled - full) * 8)] if full < width else ""
+        bar = ("█" * full + partial).ljust(width)
+        sys.stderr.write(f"\r\033[K{self.label}|{bar}|{info}")
+        sys.stderr.flush()
+
+    def write(self, text: str) -> None:
+        """Print a line above the bar without breaking it."""
+        if self.enabled:
+            sys.stderr.write("\r\033[K")
+        print(text, file=sys.stderr)
+        self.draw()
+
+    def close(self) -> None:
+        self.update(self.total, force=True)
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+def fmt_clock(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_mb(n: float) -> str:
+    return f"{n / 1e6:.0f}"
 
 
 # ---------------------------------------------------------------------------
@@ -49,33 +121,40 @@ def download_models(model_dir: Path, size: str) -> None:
         if path.exists() and path.stat().st_size > 0:
             continue
         url = VAD_URL if key == "vad" else f"{base}/{path.name}"
-        print(f"Mengunduh {path.name} ...", file=sys.stderr)
+        print(f"Downloading {path.name} ...", file=sys.stderr)
         tmp = path.with_suffix(path.suffix + ".part")
         for attempt in range(10):
             try:
                 fetch_resumable(url, tmp)
                 break
             except OSError as e:
-                print(f"  koneksi terputus ({e}), mencoba lagi ...", file=sys.stderr)
+                print(f"  connection lost ({e}), retrying ...", file=sys.stderr)
                 time.sleep(2)
         else:
-            sys.exit(f"Gagal mengunduh {url}")
+            sys.exit(f"Failed to download {url}")
         tmp.rename(path)
 
 
 def fetch_resumable(url: str, dst: Path) -> None:
-    """Unduh `url` ke `dst`, melanjutkan dari ukuran file yang sudah ada."""
+    """Download `url` to `dst`, resuming from the size of any existing file."""
     offset = dst.stat().st_size if dst.exists() else 0
     req = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        mode = "ab" if offset and resp.status == 206 else "wb"
-        with open(dst, mode) as f:
+        resumed = offset and resp.status == 206
+        if not resumed:
+            offset = 0
+        total = offset + int(resp.headers.get("Content-Length") or 0)
+        bar = ProgressBar(total, f"  {dst.stem} ", " MB", fmt_mb)
+        bar.update(offset)
+        with open(dst, "ab" if resumed else "wb") as f:
             while chunk := resp.read(1 << 20):
                 f.write(chunk)
+                bar.advance(len(chunk))
+        bar.close()
 
 
 # ---------------------------------------------------------------------------
-# 1. Konversi audio
+# 1. Audio conversion
 # ---------------------------------------------------------------------------
 
 def convert_to_wav(src: Path, dst: Path) -> None:
@@ -95,17 +174,17 @@ def read_wav(path: Path) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 2. Pemotongan dengan VAD
+# 2. VAD segmentation
 # ---------------------------------------------------------------------------
 
 def vad_segments(samples: np.ndarray, vad_model: Path, args) -> list[tuple[float, np.ndarray]]:
-    """Kembalikan list (waktu_mulai_detik, sampel) untuk tiap potongan ucapan."""
+    """Return a list of (start_seconds, samples) for each speech segment."""
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(vad_model)
     config.silero_vad.threshold = args.vad_threshold
     config.silero_vad.min_silence_duration = args.min_silence
     config.silero_vad.min_speech_duration = 0.25
-    # Whisper hanya menerima maks 30 detik per input.
+    # Whisper only accepts up to 30 seconds per input.
     config.silero_vad.max_speech_duration = args.max_speech
     config.sample_rate = SAMPLE_RATE
     config.num_threads = 1
@@ -121,16 +200,19 @@ def vad_segments(samples: np.ndarray, vad_model: Path, args) -> list[tuple[float
             segments.append((seg.start / SAMPLE_RATE, np.array(seg.samples, dtype=np.float32)))
             vad.pop()
 
+    bar = ProgressBar(len(samples) / SAMPLE_RATE, "      VAD ", " s", fmt_clock)
     for i in range(0, len(samples), window):
         vad.accept_waveform(samples[i:i + window])
         drain()
+        bar.update(i / SAMPLE_RATE)
     vad.flush()
     drain()
+    bar.close()
     return segments
 
 
 # ---------------------------------------------------------------------------
-# 3. Transkripsi
+# 3. Transcription
 # ---------------------------------------------------------------------------
 
 def create_recognizer(files: dict, args) -> sherpa_onnx.OfflineRecognizer:
@@ -153,7 +235,7 @@ def transcribe(recognizer, samples: np.ndarray) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. Pembuatan SRT
+# 4. SRT generation
 # ---------------------------------------------------------------------------
 
 def wrap_words(words: list[str], max_chars: int) -> list[str]:
@@ -170,10 +252,10 @@ def wrap_words(words: list[str], max_chars: int) -> list[str]:
 
 
 def split_into_cues(text: str, max_chars: int, max_lines: int) -> list[str]:
-    """Pecah teks menjadi cue berisi maks `max_lines` baris x `max_chars` karakter.
+    """Split text into cues of at most `max_lines` lines x `max_chars` characters.
 
-    Batas kalimat diutamakan; kalimat yang terlalu panjang dibungkus per kata,
-    lalu dikelompokkan per `max_lines` baris.
+    Sentence boundaries take priority; sentences that are too long are word-wrapped
+    and spread evenly over as few cues as possible.
     """
     sentences = [s for s in re.split(r"(?<=[.!?…])\s+", text) if s]
     cues = []
@@ -191,7 +273,7 @@ def split_into_cues(text: str, max_chars: int, max_lines: int) -> list[str]:
 
 
 def split_evenly(words: list[str], n: int) -> list[list[str]]:
-    """Bagi kata menjadi `n` kelompok dengan jumlah karakter yang kira-kira sama."""
+    """Split words into `n` groups with roughly equal character counts."""
     if n <= 1:
         return [words]
     total = sum(len(w) + 1 for w in words)
@@ -216,7 +298,7 @@ def fmt_time(t: float) -> str:
 
 
 def build_cues(start: float, duration: float, text: str, max_chars: int, max_lines: int):
-    """Bagi durasi potongan ke tiap cue secara proporsional dengan jumlah karakter."""
+    """Split the segment duration across its cues in proportion to character count."""
     parts = split_into_cues(text, max_chars, max_lines)
     total = sum(len(p.replace("\n", " ")) for p in parts) or 1
     t = start
@@ -237,28 +319,29 @@ def write_srt(cues, path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Buat subtitle SRT dengan Whisper + Silero VAD (offline, CPU).")
-    p.add_argument("input", nargs="?", type=Path, help="file audio/video (mp3, wav, mp4, ...)")
-    p.add_argument("-o", "--output", type=Path, help="file SRT keluaran (default: <input>.srt)")
-    p.add_argument("-l", "--language", default="id", help="kode bahasa Whisper (default: id)")
-    p.add_argument("--model", default="medium", help="ukuran Whisper: tiny/base/small/medium (default: medium)")
+    p = argparse.ArgumentParser(description="Generate SRT subtitles with Whisper + Silero VAD (offline, CPU).")
+    p.add_argument("input", nargs="?", type=Path, help="audio/video file (mp3, wav, mp4, ...)")
+    p.add_argument("-o", "--output", type=Path, help="output SRT file (default: <input>.srt)")
+    p.add_argument("-l", "--language", default="id", help="Whisper language code (default: id = Indonesian)")
+    p.add_argument("--model", default="medium", help="Whisper size: tiny/base/small/medium (default: medium)")
     p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    p.add_argument("--download-models", action="store_true", help="unduh model lalu keluar")
+    p.add_argument("--download-models", action="store_true", help="download the models and exit")
     p.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    p.add_argument("--max-chars", type=int, default=42, help="maks karakter per baris (default: 42)")
-    p.add_argument("--max-lines", type=int, default=2, help="maks baris per subtitle (default: 2)")
+    p.add_argument("--max-chars", type=int, default=42, help="max characters per line (default: 42)")
+    p.add_argument("--max-lines", type=int, default=2, help="max lines per subtitle (default: 2)")
     p.add_argument("--vad-threshold", type=float, default=0.5)
-    p.add_argument("--min-silence", type=float, default=0.5, help="jeda (detik) pemisah potongan")
-    p.add_argument("--max-speech", type=float, default=20.0, help="panjang maks potongan (detik, <30)")
+    p.add_argument("--min-silence", type=float, default=0.5, help="pause (seconds) that separates segments")
+    p.add_argument("--max-speech", type=float, default=20.0, help="max segment length (seconds, <30)")
+    p.add_argument("-v", "--verbose", action="store_true", help="print each segment's text during transcription")
     args = p.parse_args()
 
     if args.download_models:
         download_models(args.model_dir, args.model)
         return
     if not args.input:
-        p.error("input wajib diisi")
+        p.error("input is required")
     if not args.input.exists():
-        p.error(f"file tidak ditemukan: {args.input}")
+        p.error(f"file not found: {args.input}")
 
     files = model_files(args.model_dir, args.model)
     if not all(f.exists() for f in files.values()):
@@ -269,27 +352,34 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "audio.wav"
-        print("[1/4] Konversi audio ke WAV mono 16 kHz ...", file=sys.stderr)
+        print("[1/4] Converting audio to mono 16 kHz WAV ...", file=sys.stderr)
         convert_to_wav(args.input, wav)
         samples = read_wav(wav)
 
-    print(f"[2/4] Deteksi ucapan (VAD) pada {len(samples) / SAMPLE_RATE:.1f} detik audio ...", file=sys.stderr)
+    print(f"[2/4] Detecting speech (VAD) in {len(samples) / SAMPLE_RATE:.1f} s of audio ...", file=sys.stderr)
     segments = vad_segments(samples, files["vad"], args)
-    print(f"      {len(segments)} potongan ucapan", file=sys.stderr)
+    print(f"      {len(segments)} speech segments", file=sys.stderr)
 
-    print(f"[3/4] Transkripsi dengan Whisper {args.model} (bahasa: {args.language}) ...", file=sys.stderr)
+    print(f"[3/4] Transcribing with Whisper {args.model} (language: {args.language}) ...", file=sys.stderr)
     recognizer = create_recognizer(files, args)
     cues = []
+    # Progress is measured in seconds of speech, not segment count, since segment lengths vary.
+    speech_total = sum(len(seg) for _, seg in segments) / SAMPLE_RATE
+    bar = ProgressBar(speech_total, "      ASR ", " s", fmt_clock)
+    bar.draw()
     for i, (start, seg) in enumerate(segments, 1):
         duration = len(seg) / SAMPLE_RATE
         text = transcribe(recognizer, seg)
-        print(f"      [{i}/{len(segments)}] {fmt_time(start)} {text}", file=sys.stderr)
+        bar.advance(duration)
+        if args.verbose:
+            bar.write(f"      [{i}/{len(segments)}] {fmt_time(start)} {text}")
         if text:
             cues.extend(build_cues(start, duration, text, args.max_chars, args.max_lines))
+    bar.close()
 
-    print(f"[4/4] Menulis {len(cues)} subtitle ke {output}", file=sys.stderr)
+    print(f"[4/4] Writing {len(cues)} subtitles to {output}", file=sys.stderr)
     write_srt(cues, output)
-    print(f"Selesai dalam {time.time() - t0:.1f} detik.", file=sys.stderr)
+    print(f"Done in {time.time() - t0:.1f} s.", file=sys.stderr)
 
 
 if __name__ == "__main__":
