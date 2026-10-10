@@ -1,4 +1,4 @@
-# closed_captioner
+# captioner
 
 Generates `.srt` subtitles from audio/video locally on the CPU. The audio is never sent to a third-party transcription service.
 
